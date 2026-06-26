@@ -4,53 +4,35 @@ import com.wells.codi.CommonFunctions.ThrowableOps
 import com.wells.codi.Providers.WithSparkSession
 import com.wells.codi.Utils.ETLStatus
 import com.wells.codi._
-import com.typesafe.config.{Config, ConfigValueType}
 import org.apache.logging.log4j.scala.Logging
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
-import scala.collection.JavaConverters._
 
 /**
- * Neo4J target writer that conforms to the standards target-writer interface
- * (see LoadHelperHadoop.loadParquetTable) while reusing the node / relationship
- * load logic from the working Neo4J product (Neo4JWriter / Neo4JNodeLoader /
- * Neo4JRelationshipLoader).
+ * Neo4J target writer conforming to the standards target-writer interface
+ * (see LoadHelperHadoop.loadParquetTable), reusing the node / relationship
+ * load logic from the working Neo4J product.
  *
- * Design (confirmed):
- *   - CONFIG-DRIVEN. The DataFrame carries only the final business columns;
- *     the graph mapping is declared in the `neo4j { }` block of the target.
+ * Reads the parsed model from the target config:
+ *   - connection : target.tableInfo.get.targetTableInfo (TableMetaInfo, resolved
+ *                  from connectionName -> url/user/enpw/db)
+ *   - mapping    : target.tableInfo.get.neo4j (Neo4JLoadInfo)
+ *   - audit ts   : target.tableInfo.get.customIngestionTS
+ *   - saveMode   : neo4j.saveMode (precedence) else TargetTableInfo.saveMode
  *
- *   - saveMode: a single `neo4j.saveMode` variable drives BOTH nodes and
- *     relationships and takes PRECEDENCE over tableDetails.saveMode.
- *       overwrite/merge -> MERGE (keyed upsert / create-if-missing endpoints)
- *       match           -> MATCH existing endpoints (relationships)
- *       append          -> CREATE
- *
- *   - loadType:
- *       "nodes"         -> whole DataFrame (all columns + audit) written per node spec.
- *       "relationships" -> whole DataFrame (all columns + audit) written per rel spec.
- *       "both"          -> single DataFrame split by COLUMN PROJECTION: each spec
- *                          takes its configured `properties` + key columns + audit
- *                          columns (or the whole DataFrame when `properties` absent).
- *
- *   - Audit timestamp handling is identical to the working sample: distinct
- *     values of the audit ts column (customIngestionTS) are normalized into
- *     tokens and used to scope the post-write count read-back.
- *
- *   - NO duplicate elimination, NO distinct on the data. Writes use MERGE/MATCH
- *     per saveMode. Only COUNT VALIDATION is performed (written rows vs Neo4J
- *     read-back). NO rollback: on any failure the job is marked failure and any
- *     partial graph is left in place.
- *
- * Wiring points (marked WIRING POINT) bind this class to your model.
+ * Behavior (confirmed):
+ *   - loadType "nodes" / "relationships": whole DataFrame (all columns + audit)
+ *     written per spec. loadType "both": single DataFrame split by column
+ *     projection (properties + key columns + audit), nodes first then rels.
+ *   - Audit timestamp scoping for count read-back is identical to the working
+ *     sample (distinct ts values -> normalized tokens -> cypher IN filter).
+ *   - NO dedup / NO distinct on data; MERGE/MATCH per saveMode.
+ *   - Only COUNT VALIDATION (written rows vs Neo4J read-back). NO rollback.
  *
  * Entry point:
  *     val out: TESLA_DF = Neo4JLoadHelper.loadNeo4J(target)(testlaDF)
  */
 object Neo4JLoadHelper extends Logging with WithSparkSession {
 
-  // ---------------------------------------------------------------------------
-  // Constants
-  // ---------------------------------------------------------------------------
   private val TARGET_NODES = "Neo4J:nodes"
   private val TARGET_RELATIONSHIPS = "Neo4J:relationships"
   private val TARGET_BOTH = "Neo4J:nodes+relationships"
@@ -63,41 +45,15 @@ object Neo4JLoadHelper extends Logging with WithSparkSession {
   private val NEO4J_FORMAT = "org.neo4j.spark.DataSource"
 
   // ---------------------------------------------------------------------------
-  // Config specs (parsed from the neo4j { } block)
-  // ---------------------------------------------------------------------------
-  private case class EndpointSpec(labels: String, nodeKeys: String)
-  private case class NodeSpec(labels: String, nodeKeys: String, properties: Option[List[String]])
-  private case class RelationshipSpec(
-    relationshipType: String,
-    source: EndpointSpec,
-    target: EndpointSpec,
-    properties: Option[List[String]]
-  )
-
-  // ---------------------------------------------------------------------------
-  // Wiring points - adjust to your TargetInfo / TableInfo schema
-  // ---------------------------------------------------------------------------
-
-  /** WIRING POINT (connection): TableMetaInfo(url,user,enpw,db) resolved from connectionName. */
-  private def neo4jInfoFrom(target: TargetInfo): TableMetaInfo =
-    target.tableMetaInfo
-
-  /** WIRING POINT (mapping): the parsed `neo4j { }` HOCON block as a typesafe Config. */
-  private def neo4jConfigFrom(target: TargetInfo): Config =
-    target.tableInfo.get.neo4j
-
-  /** WIRING POINT (audit ts): the timestamp column used to scope count read-back. */
-  private def ingestionTsColumn(target: TargetInfo): String =
-    Option(target.tableInfo.get.customIngestionTS).map(_.trim).filter(_.nonEmpty).getOrElse(DEFAULT_TS_COL)
-
-  // ---------------------------------------------------------------------------
   // Standards entry point: (target)(testlaDF) => TESLA_DF
   // ---------------------------------------------------------------------------
   def loadNeo4J(target: TargetInfo)(testlaDF: TESLA_DF): TESLA_DF = {
     val tableInfo = target.tableInfo.get
+    val neo4jInfo = tableInfo.targetTableInfo
     val defaultSaveMode = tableInfo.saveMode.toLowerCase
-    val targetTable = tableInfo.targetTableInfo.db + "." + tableInfo.targetTableInfo.table
+    val targetTable = neo4jInfo.db + "." + neo4jInfo.table
     val successOnEmptyExtract = target.successOnEmptyExtract
+    val tsCol = tableInfo.customIngestionTS.map(_.trim).filter(_.nonEmpty).getOrElse(DEFAULT_TS_COL)
 
     var loadTestlaDF = testlaDF
     val df = testlaDF.df
@@ -111,30 +67,29 @@ object Neo4JLoadHelper extends Logging with WithSparkSession {
 
     if (recordCount > 0) {
       try {
-        val neo4jInfo = neo4jInfoFrom(target)
-        val cfg = neo4jConfigFrom(target)
-        val tsCol = ingestionTsColumn(target)
-
+        val loadInfo = tableInfo.neo4j.getOrElse(
+          throw CODIException("Neo4J target requested but 'neo4j' block is missing under tableDetails.")
+        )
         // neo4j.saveMode takes precedence over tableDetails.saveMode; applies to nodes + relationships.
-        val effectiveMode = optString(cfg, "saveMode").getOrElse(defaultSaveMode)
-        val loadType = cfg.getString("loadType").trim.toLowerCase
+        val effectiveMode = loadInfo.saveMode.map(_.trim).filter(_.nonEmpty).getOrElse(defaultSaveMode)
+        val loadType = loadInfo.loadType.trim.toLowerCase
         logger.info(s"Neo4JLoadHelper.loadNeo4J - loadType=$loadType effectiveSaveMode=$effectiveMode tsCol=$tsCol")
 
         val (resolvedTarget, inserted) = loadType match {
           case LOAD_TYPE_NODES =>
-            val nodeSpecs = parseNodeSpecs(cfg)
+            val nodeSpecs = requireNodes(loadInfo)
             (TARGET_NODES,
               loadNodesInternal(spark, neo4jInfo, tsCol, effectiveMode, nodeSpecs, df, projectColumns = false))
 
           case LOAD_TYPE_RELATIONSHIPS =>
-            val relSpecs = parseRelationshipSpecs(cfg)
+            val relSpecs = requireRelationships(loadInfo)
             (TARGET_RELATIONSHIPS,
               loadRelationshipsInternal(spark, neo4jInfo, tsCol, effectiveMode, relSpecs, df, projectColumns = false))
 
           case LOAD_TYPE_BOTH =>
             // Single DataFrame -> nodes first (so endpoints exist), then relationships.
-            val nodeSpecs = parseNodeSpecs(cfg)
-            val relSpecs = parseRelationshipSpecs(cfg)
+            val nodeSpecs = requireNodes(loadInfo)
+            val relSpecs = requireRelationships(loadInfo)
             val nodesInserted =
               loadNodesInternal(spark, neo4jInfo, tsCol, effectiveMode, nodeSpecs, df, projectColumns = true)
             val relsInserted =
@@ -185,61 +140,15 @@ object Neo4JLoadHelper extends Logging with WithSparkSession {
     loadTestlaDF
   }
 
-  // ---------------------------------------------------------------------------
-  // Config parsing
-  // ---------------------------------------------------------------------------
-  private def parseNodeSpecs(cfg: Config): List[NodeSpec] = {
-    if (!cfg.hasPath("nodes")) {
-      throw CODIException("Neo4J node load requested but no 'nodes = [ ... ]' block found in config.")
-    }
-    val specs = cfg.getConfigList("nodes").asScala.toList.map { c =>
-      NodeSpec(
-        labels = c.getString("labels"),
-        nodeKeys = c.getString("nodeKeys"),
-        properties = optCsvList(c, "properties")
-      )
-    }
-    if (specs.isEmpty) {
-      throw CODIException("Neo4J node load requested but 'nodes' block is empty.")
-    }
-    specs
-  }
+  private def requireNodes(loadInfo: Neo4JLoadInfo): List[Neo4JNodeInfo] =
+    loadInfo.nodes.filter(_.nonEmpty).getOrElse(
+      throw CODIException("Neo4J node load requires a non-empty 'nodes' block.")
+    )
 
-  private def parseRelationshipSpecs(cfg: Config): List[RelationshipSpec] = {
-    if (!cfg.hasPath("relationships")) {
-      throw CODIException("Neo4J relationship load requested but no 'relationships = [ ... ]' block found in config.")
-    }
-    val specs = cfg.getConfigList("relationships").asScala.toList.map { c =>
-      RelationshipSpec(
-        relationshipType = c.getString("relationshipType"),
-        source = parseEndpoint(c.getConfig("source")),
-        target = parseEndpoint(c.getConfig("target")),
-        properties = optCsvList(c, "properties")
-      )
-    }
-    if (specs.isEmpty) {
-      throw CODIException("Neo4J relationship load requested but 'relationships' block is empty.")
-    }
-    specs
-  }
-
-  private def parseEndpoint(c: Config): EndpointSpec =
-    EndpointSpec(labels = c.getString("labels"), nodeKeys = c.getString("nodeKeys"))
-
-  private def optString(c: Config, path: String): Option[String] =
-    if (c.hasPath(path)) Option(c.getString(path)).map(_.trim).filter(_.nonEmpty) else None
-
-  /** Parses a property list given either as a comma-string ("a,b,c") or a HOCON list. */
-  private def optCsvList(c: Config, path: String): Option[List[String]] = {
-    if (!c.hasPath(path)) None
-    else {
-      val items =
-        if (c.getValue(path).valueType == ConfigValueType.LIST) c.getStringList(path).asScala.toList
-        else c.getString(path).split(",").toList
-      val cleaned = items.map(_.trim).filter(_.nonEmpty)
-      if (cleaned.isEmpty) None else Some(cleaned)
-    }
-  }
+  private def requireRelationships(loadInfo: Neo4JLoadInfo): List[Neo4JRelationshipInfo] =
+    loadInfo.relationships.filter(_.nonEmpty).getOrElse(
+      throw CODIException("Neo4J relationship load requires a non-empty 'relationships' block.")
+    )
 
   // ---------------------------------------------------------------------------
   // Node load (count-validation only; no dedup; no rollback)
@@ -249,7 +158,7 @@ object Neo4JLoadHelper extends Logging with WithSparkSession {
     neo4jInfo: TableMetaInfo,
     tsCol: String,
     effectiveMode: String,
-    specs: List[NodeSpec],
+    specs: List[Neo4JNodeInfo],
     df: DataFrame,
     projectColumns: Boolean
   ): Long = {
@@ -300,7 +209,7 @@ object Neo4JLoadHelper extends Logging with WithSparkSession {
     neo4jInfo: TableMetaInfo,
     tsCol: String,
     effectiveMode: String,
-    specs: List[RelationshipSpec],
+    specs: List[Neo4JRelationshipInfo],
     df: DataFrame,
     projectColumns: Boolean
   ): Long = {
@@ -448,7 +357,7 @@ object Neo4JLoadHelper extends Logging with WithSparkSession {
   /**
    * Returns the DataFrame to write for a spec.
    *   - projectColumns=false (node-only / relationship-only): whole DataFrame.
-   *   - projectColumns=true  ("both") with properties supplied: project
+   *   - projectColumns=true ("both") with properties supplied: project
    *     properties + key columns + audit ts column.
    *   - projectColumns=true with no properties: whole DataFrame.
    * No distinct / dedup is performed.
@@ -548,9 +457,9 @@ object Neo4JLoadHelper extends Logging with WithSparkSession {
 
   /**
    * Relationship endpoint-node save mode (uses merge or match based on saveMode):
-   *   match            -> Match     (endpoints must already exist)
-   *   overwrite/merge  -> Overwrite (MERGE: create endpoint nodes if missing)
-   *   append           -> Append    (CREATE endpoint nodes)
+   *   match           -> Match     (endpoints must already exist)
+   *   overwrite/merge -> Overwrite (MERGE: create endpoint nodes if missing)
+   *   append          -> Append    (CREATE endpoint nodes)
    */
   private def endpointSaveModeFrom(mode: String): String = mode.trim.toLowerCase match {
     case "match" => "Match"
